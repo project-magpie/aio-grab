@@ -37,9 +37,46 @@ Feel free to use the code for your own projects. See LICENSE file for details.
 #include <sys/mman.h>
 #include <linux/types.h>
 #include <linux/fb.h>
-
+#include <bpamem.h>
 #include "png.h"
 #include "jpeglib.h"
+
+#define OUT(x) \
+	out[OUTITER]=(unsigned char)*(decode_surface + x)&0xFF; \
+	OUTITER+=OUTINC;
+
+#define OUT4(x) \
+	OUT(x + 0x03); \
+	OUT(x + 0x02); \
+	OUT(x + 0x01); \
+	OUT(x + 0x00);
+
+#define OUT8(x) \
+	OUT4(x + 0x04); \
+	OUT4(x + 0x00);
+
+#define OUT_LU_16A(x) \
+	OUT8(x); \
+	OUT8(x + 0x40);
+
+#define OUT_CH_8A(x) \
+	OUT4(x); \
+	OUT4(x + 0x20);
+
+//pppppppppppppppp
+//x: macroblock address
+//l: line 0-15
+#define OUT_LU_16(x,l) \
+	OUT_LU_16A(x + (l/4) * 0x10 + (l%2) * 0x80 + ((l/2)%2?0x00:0x08));
+
+//pppppppp
+//x: macroblock address
+//l: line 0-7
+//b: 0=cr 1=cb
+#define OUT_CH_8(x,l,b) \
+	OUT_CH_8A(x + (l/4) * 0x10 + (l%2) * 0x40 + ((l/2)%2?0x00:0x08) + (b?0x04:0x00));
+
+//----
 
 #define CLAMP(x)    ((x < 0) ? 0 : ((x > 255) ? 255 : x))
 #define SWAP(x,y)	{ x ^= y; y ^= x; x ^= y; }
@@ -83,18 +120,16 @@ void fast_resize(const unsigned char *source, unsigned char *dest, int xsource, 
 void (*resize)(const unsigned char *source, unsigned char *dest, int xsource, int ysource, int xdest, int ydest, int colors);
 void combine(unsigned char *output, const unsigned char *video, const unsigned char *osd, int vleft, int vtop, int vwidth, int vheight, int xres, int yres);
 
-static enum {UNKNOWN, AZBOX863x, AZBOX865x, PALLAS, VULCAN, XILLEON, BRCM7400, BRCM7401, BRCM7405, BRCM7325, BRCM7335, BRCM7358, BRCM7241, BRCM7356, BRCM7424, BRCM7425} stb_type = UNKNOWN;
-
-static int chr_luma_stride = 0x40;
-static int chr_luma_register_offset = 0;
-static unsigned int registeroffset = 0;
-static unsigned int mem2memdma_register = 0;
-static int quiet = 0;
+enum {UNKNOWN,PALLAS,VULCAN,XILLEON,BRCM7400,BRCM7401,BRCM7405,BRCM7335,BRCM7358,ST};
+char *stb_name[]={"unknown","Pallas","Vulcan","Xilleon","Brcm7400","Brcm7401","Brcm7405","Brcm7335","Brcm7358","ST"};
+int stb_type=UNKNOWN;
 
 // main program
 
-int main(int argc, char **argv)
-{
+int main(int argc, char **argv) {
+
+	printf("AiO Screengrabber");
+
 	int xres_v,yres_v,xres_o,yres_o,xres,yres,aspect;
 	int c,osd_only,video_only,use_osd_res,width,use_png,use_jpg,jpg_quality,no_aspect,use_letterbox;
 
@@ -110,211 +145,167 @@ int main(int argc, char **argv)
 	unsigned char *video, *osd, *output;
 	int output_bytes=3;
 
-	const char* filename = "/tmp/screenshot.bmp";
+	char filename[256];
+	sprintf(filename,"/tmp/screenshot.bmp");
 
 	// detect STB
 	char buf[256];
-	FILE *fp = fopen("/proc/fb","r");
-	if (!fp)
+	FILE *pipe = fopen("/proc/fb","r");
+	if (!pipe)
 	{
-		fprintf(stderr, "No framebuffer, unknown STB .. quit.\n");
+		printf("No framebuffer, unknown STB .. quit.\n");
 		return 1;
 	}
-
-	while (fgets(buf,sizeof(buf),fp))
+	while (fgets(buf,sizeof(buf),pipe))
 	{
-		if (strcasestr(buf,"VULCAN")) stb_type=VULCAN;
-		if (strcasestr(buf,"PALLAS")) stb_type=PALLAS;
-		if (strcasestr(buf,"XILLEON")) stb_type=XILLEON;
-		if (strcasestr(buf,"EM863x")) stb_type=AZBOX863x;
-		if (strcasestr(buf,"EM865x")) stb_type=AZBOX865x;		
+		if(strcasestr(buf,"VULCAN"))
+			stb_type=VULCAN;
+		else if(strcasestr(buf,"PALLAS"))
+			stb_type=PALLAS;
+		else if(strcasestr(buf,"XILLEON"))
+			stb_type=XILLEON;
+		else if(strcasestr(buf,"BCM7401") || strcasestr(buf,"BCMFB"))
+			stb_type=BRCM7401;
+		else if(strcasestr(buf,"STi") || strcasestr(buf,"STx"))
+			stb_type=ST;
 	}
-	fclose(fp);
+	pclose(pipe);
 
-	if (stb_type == UNKNOWN)
+	if (stb_type == BRCM7401) // All Broadcom STB's use the same framebuffer string, so fall back to /proc/stb/info/vumodel for detecting the Vu+Duo
 	{
-		FILE *file = fopen("/proc/stb/info/chipset", "r");
-		if (file)
+		pipe = fopen("/proc/stb/info/vumodel", "r");
+		if (pipe)
 		{
-			char buf[32];
-			while (fgets(buf, sizeof(buf), file))
+			while (fgets(buf,sizeof(buf),pipe))
 			{
-				if (strstr(buf,"7400"))
-				{
-					stb_type = BRCM7400;
-					break;
-				}
-				else if (strstr(buf,"7401"))
-				{
-					stb_type = BRCM7401;
-					break;
-				}
-				else if (strstr(buf,"7403"))
-				{
-					stb_type = BRCM7401;
-					break;
-				}				
-				else if (strstr(buf,"7405"))
-				{
-					stb_type = BRCM7405;
-					break;
-				}
-				else if (strstr(buf,"7413"))
-				{
-					stb_type = BRCM7405;
-					break;
-				}
-				else if (strstr(buf,"7335"))
+				if (strcasestr(buf,"duo"))
 				{
 					stb_type = BRCM7335;
 					break;
 				}
-				else if (strstr(buf,"7325"))
-				{
-					stb_type = BRCM7325;
-					break;
-				}
-				else if (strstr(buf,"7358"))
-				{
-					stb_type = BRCM7358;
-					break;
-				}
-				else if (strstr(buf,"7241"))
-				{
-					stb_type = BRCM7241;
-					break;
-				}
-				else if (strstr(buf,"7356"))
-				{
-					stb_type = BRCM7356;
-					break;
-				}
-				else if (strstr(buf,"7424"))
-				{
-					stb_type = BRCM7424;
-					break;
-				}
-				else if (strstr(buf,"7425"))
-				{
-					stb_type = BRCM7425;
-					break;
-				}
 			}
-			fclose(file);
+			fclose(pipe);
 		}
 	}
-
-	if (stb_type == UNKNOWN)
+	if (stb_type == BRCM7401) // All Broadcom Dreamboxes use the same framebuffer string, so fall back to /proc/stb/info/model for detecting DM8000/DM500HD
 	{
-		FILE *file = fopen("/proc/stb/info/model", "r");
-		if (file)
+		pipe = fopen("/proc/stb/info/model", "r");
+		if (pipe)
 		{
-			char buf[32];
-			while (fgets(buf, sizeof(buf), file))
+			while (fgets(buf,sizeof(buf),pipe))
 			{
 				if (strcasestr(buf,"DM500HD") || strcasestr(buf,"DM800SE") || strcasestr(buf,"DM7020HD"))
 				{
 					stb_type = BRCM7405;
 					break;
 				}
-				else if (strcasestr(buf,"DM8000"))
-				{
-					stb_type = BRCM7400;
-					break;
-				}
-				else if (strcasestr(buf,"DM800"))
-				{
-					stb_type = BRCM7401;
-					break;
-				}
 			}
-			fclose(file);
+			fclose(pipe);
+		}
+		if (stb_type == BRCM7401)
+		{
+			pipe = fopen("/proc/cpuinfo","r");
+			if (pipe)
+			{
+				while (fgets(buf, sizeof(buf), pipe))
+				{
+					if (strcasestr(buf,"Brcm4380 V4.2"))
+					{
+						stb_type = BRCM7400;
+						break;
+					}
+					else if (strcasestr(buf,"Brcm4380 V4.4"))
+					{
+						stb_type = BRCM7335;
+						break;
+					}
+				}
+				fclose(pipe);
+			}
 		}
 	}
-
+	pipe = fopen("/proc/stb/info/chipset", "r");
+	if (pipe)
+	{
+		while (fgets(buf,sizeof(buf),pipe))
+		{
+			if (strcasestr(buf,"7400"))
+			{
+				stb_type = BRCM7400;
+				break;
+			}
+			else if (strcasestr(buf,"7401"))
+			{
+				stb_type = BRCM7401;
+				break;
+			}
+			else if (strcasestr(buf,"7405"))
+			{
+				stb_type = BRCM7405;
+				break;
+			}
+			else if (strcasestr(buf,"7335"))
+			{
+				stb_type = BRCM7335;
+				break;
+			}
+			else if (strcasestr(buf,"7358"))
+			{
+				stb_type = BRCM7358;
+				break;
+			}
+			else if (strcasestr(buf,"XILLEON"))
+			{
+				stb_type = XILLEON;
+				break;
+			}
+			else if (strcasestr(buf,"PALLAS"))
+			{
+				stb_type = PALLAS;
+				break;
+			}
+			else if (strcasestr(buf,"VULCAN"))
+			{
+				stb_type = VULCAN;
+				break;
+			}
+		}
+		fclose(pipe);
+	}
 	if (stb_type == UNKNOWN)
 	{
-		fprintf(stderr, "unknown stb type\n");
-		return -1;
+		printf("Unknown STB .. quit.\n");
+		return 1;
 	}
-
-	switch (stb_type)
+	else
 	{
-		case BRCM7400:
-			registeroffset = 0x10100000;
-			chr_luma_stride = 0x40;
-			chr_luma_register_offset = 0x20;
-			mem2memdma_register = 0x10c02000;
-			break;
-		case BRCM7401:
-			registeroffset = 0x10100000;
-			chr_luma_stride = 0x40;
-			chr_luma_register_offset = 0x20;
-			mem2memdma_register = 0;
-			break;
-		case BRCM7405:
-			registeroffset = 0x10100000;
-			chr_luma_stride = 0x80;
-			chr_luma_register_offset = 0x20;
-			mem2memdma_register = 0;
-			break;
-		case BRCM7325:
-			registeroffset = 0x10100000;
-			chr_luma_stride = 0x80;
-			chr_luma_register_offset = 0x20;
-			mem2memdma_register = 0;
-			break;
-		case BRCM7335:
-			registeroffset = 0x10100000;
-			chr_luma_stride = 0x40;
-			chr_luma_register_offset = 0x20;
-			mem2memdma_register = 0x10c01000;
-			break;
-		case BRCM7358:
-			registeroffset = 0x10600000;
-			chr_luma_stride = 0x40;
-			chr_luma_register_offset = 0x34;
-			mem2memdma_register = 0;
-			break;
-		case BRCM7241:
-		case BRCM7356:
-		case BRCM7424:
-		case BRCM7425:
-			registeroffset = 0x10600000;
-			chr_luma_stride = 0x80;
-			chr_luma_register_offset = 0x34;
-			mem2memdma_register = 0;
-			break;
-		default:
-			break;
+		printf("Detected STB: %s\n", stb_name[stb_type]);
 	}
 
 	// process command line
-	while ((c = getopt (argc, argv, "dhj:lbnopqr:sv")) != -1)
+	while ((c = getopt (argc, argv, "dhj:lbnopr:v")) != -1)
 	{
 		switch (c)
 		{
 			case 'h':
 			case '?':
-				fprintf(stderr,
-					"Usage: grab [commands] [filename]\n\n"
-					"command:\n"
-					"-o only grab osd (framebuffer) when using this with png or bmp\n"
-					"   fileformat you will get a 32bit pic with alphachannel\n"
-					"-v only grab video\n"
-					"-d always use osd resolution (good for skinshots)\n"
-					"-n dont correct 16:9 aspect ratio\n"
-					"-r (size) resize to a fixed width, maximum: 1920\n"
-					"-l always 4:3, create letterbox if 16:9\n"
-					"-b use bicubic picture resize (slow but smooth)\n"
-					"-j (quality) produce jpg files instead of bmp (quality 0-100)\n"
-					"-p produce png files instead of bmp\n"
-					"-q Quiet mode, don't output debug messages\n"
-					"-s write to stdout instead of a file\n"
-					"-h this help screen\n\n"
-					"If no command is given the complete picture will be grabbed.\n"
-					"If no filename is given /tmp/screenshot.[bmp/jpg/png] will be used.\n");
-				return 1;
+				printf("Usage: grab [commands] [filename]\n\n");
+				printf("command:\n");
+				printf("-o only grab osd (framebuffer) when using this with png or bmp\n   fileformat you will get a 32bit pic with alphachannel\n");
+				printf("-v only grab video\n");
+				printf("-d always use osd resolution (good for skinshots)\n");
+				printf("-n dont correct 16:9 aspect ratio\n");
+				printf("-r (size) resize to a fixed width, maximum: 1920\n");
+				printf("-l always 4:3, create letterbox if 16:9\n");
+				printf("-b use bicubic picture resize (slow but smooth)\n");
+				printf("-j (quality) produce jpg files instead of bmp (quality 0-100)\n");
+				printf("-p produce png files instead of bmp\n");
+				printf("-h this help screen\n\n");
+
+				printf("If no command is given the complete picture will be grabbed.\n");
+				printf("If no filename is given /tmp/screenshot.[bmp/jpg/png] will be used.\n");
+				return 0;
+				break;
 			case 'o': // OSD only
 				osd_only=1;
 				video_only=0;
@@ -327,19 +318,13 @@ int main(int argc, char **argv)
 				use_osd_res=1;
 				no_aspect=1;
 				break;
-			case 'q': // quiet
-				++quiet;
-				break;
 			case 'r': // use given resolution
 				width=atoi(optarg);
 				if (width > 1920)
 				{
-					fprintf(stderr, "Error: -r (size) ist limited to 1920 pixel !\n");
+					printf("Error: -r (size) ist limited to 1920 pixel !\n");
 					return 1;
 				}
-				break;
-			case 's': // stdout
-				filename = NULL;
 				break;
 			case 'l': // create letterbox
 				use_letterbox=1;
@@ -350,15 +335,13 @@ int main(int argc, char **argv)
 			case 'p': // use png file format
 				use_png=1;
 				use_jpg=0;
-				if (filename)
-					filename = "/tmp/screenshot.png";
+				sprintf(filename,"/tmp/screenshot.png");
 				break;
 			case 'j': // use jpg file format
 				use_jpg=1;
 				use_png=0;
 				jpg_quality=atoi(optarg);
-				if (filename)
-					filename = "/tmp/screenshot.jpg";
+				sprintf(filename,"/tmp/screenshot.jpg");
 				break;
 			case 'n':
 				no_aspect=1;
@@ -366,10 +349,9 @@ int main(int argc, char **argv)
 		}
 	}
 	if (optind < argc) // filename
-		filename = argv[optind];
+		sprintf(filename,"%s", argv[optind]);
 
 	int mallocsize=1920*1080;
-
 	if (stb_type == VULCAN || stb_type == PALLAS)
 		mallocsize=720*576;
 
@@ -387,59 +369,54 @@ int main(int argc, char **argv)
 
 	// get video
 	if (!osd_only)
-	{
-		if (!quiet)
-			fprintf(stderr, "Grabbing Video ...\n");
 		getvideo(video,&xres_v,&yres_v);
-	}
 
 	// get aspect ratio
 	if (stb_type == VULCAN || stb_type == PALLAS)
 	{
-		fp = fopen("/proc/bus/bitstream","r");
-		if (fp)
+		pipe = fopen("/proc/bus/bitstream","r");
+		if (pipe)
 		{
-			while (fgets(buf,sizeof(buf),fp))
+			while (fgets(buf,sizeof(buf),pipe))
 				sscanf(buf,"A_RATIO: %d",&aspect);
-			fclose(fp);
+			fclose(pipe);
 		}
-	}
-	else
+	} else
 	{
-		fp = fopen("/proc/stb/vmpeg/0/aspect", "r");
-		if (fp)
+		pipe = fopen("/proc/stb/vmpeg/0/aspect", "r");
+		if (pipe)
 		{
-			while (fgets(buf,sizeof(buf), fp))
+			while (fgets(buf,sizeof(buf), pipe))
 				sscanf(buf,"%x",&aspect);
-			fclose(fp);
+			fclose(pipe);
 		}
-		fp = fopen("/proc/stb/vmpeg/0/dst_width", "r");
-		if (fp)
+		pipe = fopen("/proc/stb/vmpeg/0/dst_width", "r");
+		if (pipe)
 		{
-			while (fgets(buf,sizeof(buf), fp))
+			while (fgets(buf,sizeof(buf), pipe))
 				sscanf(buf,"%x",&dst_width);
-			fclose(fp);
+			fclose(pipe);
 		}
-		fp = fopen("/proc/stb/vmpeg/0/dst_height", "r");
-		if (fp)
+		pipe = fopen("/proc/stb/vmpeg/0/dst_height", "r");
+		if (pipe)
 		{
-			while (fgets(buf,sizeof(buf), fp))
+			while (fgets(buf,sizeof(buf), pipe))
 				sscanf(buf,"%x",&dst_height);
-			fclose(fp);
+			fclose(pipe);
 		}
-		fp = fopen("/proc/stb/vmpeg/0/dst_top", "r");
-		if (fp)
+		pipe = fopen("/proc/stb/vmpeg/0/dst_top", "r");
+		if (pipe)
 		{
-			while (fgets(buf,sizeof(buf), fp))
+			while (fgets(buf,sizeof(buf), pipe))
 				sscanf(buf,"%x",&dst_top);
-			fclose(fp);
+			fclose(pipe);
 		}
-		fp = fopen("/proc/stb/vmpeg/0/dst_left", "r");
-		if (fp)
+		pipe = fopen("/proc/stb/vmpeg/0/dst_left", "r");
+		if (pipe)
 		{
-			while (fgets(buf,sizeof(buf), fp))
+			while (fgets(buf,sizeof(buf), pipe))
 				sscanf(buf,"%x",&dst_left);
-			fclose(fp);
+			fclose(pipe);
 		}
 		if (dst_width == 720) dst_width = 0;
 		if (dst_height == 576) dst_height = 0;
@@ -450,18 +427,15 @@ int main(int argc, char **argv)
 	{
 		xres=xres_v;
 		yres=yres_v;
-	}
-	else if (osd_only)
+	} else if (osd_only)
 	{
 		xres=xres_o;
 		yres=yres_o;
-	}
-	else if (xres_o == xres_v && yres_o == yres_v && !dst_top && !dst_left && !dst_width && !dst_height)
+	} else if (xres_o == xres_v && yres_o == yres_v && !dst_top && !dst_left && !dst_width && !dst_height)
 	{
 		xres=xres_v;
 		yres=yres_v;
-	}
-	else
+	} else
 	{
 		if (xres_v > xres_o && !use_osd_res && (width == 0 || width > xres_o))
 		{
@@ -495,20 +469,19 @@ int main(int argc, char **argv)
 		}
 		if (xres_o != xres || yres_o != yres)
 		{
-			if (!quiet)
-				fprintf(stderr, "Resizing OSD to %d x %d ...\n", xres, yres);
+			printf("Resizing OSD to %d x %d ...\n", xres, yres);
 			resize(osd, output, xres_o, yres_o, xres, yres, 4);
 			memcpy(osd, output, xres * yres * 4);
 		}
 		if (xres_v != dst_width || yres_v != dst_height)
 		{
-			if (!quiet)
-				fprintf(stderr, "Resizing Video to %d x %d ...\n", dst_width, dst_height);
+			printf("Resizing Video to %d x %d ...\n", dst_width, dst_height);
 			resize(video, output, xres_v, yres_v, dst_width, dst_height, 3);
 			memset(video, 0, xres_v * yres_v * 3);
 			memcpy(video, output, dst_width * dst_height * 3);
 		}
 	}
+
 
 	// merge video and osd if neccessary
 	if (osd_only)
@@ -517,44 +490,41 @@ int main(int argc, char **argv)
 		output_bytes=4;
 	}
 	else if (video_only)
-	{
 		memcpy(output,video,xres*yres*3);
-	}
 	else
 	{
-		if (!quiet)
-			fprintf(stderr, "Merge Video with Framebuffer ...\n");
+		printf("Merge Video with Framebuffer ...\n");
 		combine(output, video, osd, dst_left, dst_top, dst_width ? dst_width : xres, dst_height ? dst_height : yres, xres, yres);
 	}
+
 
 	// resize to specific width ?
 	if (width)
 	{
-		if (!quiet)
-			fprintf(stderr, "Resizing Screenshot to %d x %d ...\n",width,yres*width/xres);
+		printf("Resizing Screenshot to %d x %d ...\n",width,yres*width/xres);
 		resize(output,osd,xres,yres,width,(yres*width/xres),output_bytes);
 		yres=yres*width/xres;
 		xres=width;
 		memcpy(output,osd,xres*yres*output_bytes);
 	}
 
+
 	// correct aspect ratio
 	if (!no_aspect && aspect == 3 && ((float)xres/(float)yres)<1.5)
 	{
-		if (!quiet)
-			fprintf(stderr, "Correct aspect ratio to 16:9 ...\n");
+		printf("Correct aspect ratio to 16:9 ...\n");
 		resize(output,osd,xres,yres,xres,yres/1.42,output_bytes);
 		yres/=1.42;
 		memcpy(output,osd,xres*yres*output_bytes);
 	}
+
 
 	// use letterbox ?
 	if (use_letterbox && xres*0.8 != yres && xres*0.8 <= 1080)
 	{
 		int yres_neu;
 		yres_neu=xres*0.8;
-		if (!quiet)
-			fprintf(stderr, "Create letterbox %d x %d ...\n",xres,yres_neu);
+		printf("Create letterbox %d x %d ...\n",xres,yres_neu);
 		if (yres_neu > yres)
 		{
 			int ofs;
@@ -566,21 +536,11 @@ int main(int argc, char **argv)
 		yres=yres_neu;
 	}
 
+
 	// saving picture
-	if (!quiet)
-			fprintf(stderr, "Saving %d bit %s ...\n",(use_jpg?3*8:output_bytes*8), filename ? filename : "<stdout>");
-	FILE *fd2;
-	if (filename)
-	{
-		fd2 = fopen(filename, "wr");
-		if (!fd2)
-		{
-			fprintf(stderr, "Failed to open '%s' for output\n", filename);
-			return 1;
-		}
-	}
-	else
-		fd2 = stdout;
+	printf("Saving %d bit %s ...\n",(use_jpg?3*8:output_bytes*8),filename);
+	FILE *fd2 = fopen(filename, "wr");
+	if (!fd2) return 1;
 
 	if (!use_png && !use_jpg)
 	{
@@ -603,10 +563,10 @@ int main(int argc, char **argv)
 		fwrite(hdr, 1, i, fd2);
 
 		int y;
-		for (y=yres-1; y>=0 ; y-=1)
+		for (y=yres-1; y>=0 ; y-=1) {
 			fwrite(output+(y*xres*output_bytes),xres*output_bytes,1,fd2);
-	}
-	else if (use_png)
+		}
+	} else if (use_png)
 	{
 		// write png
 		png_bytep *row_pointers;
@@ -631,10 +591,8 @@ int main(int argc, char **argv)
 		png_destroy_write_struct(&png_ptr, &info_ptr);
 
 		free(row_pointers);
-	}
-	else
+	} else
 	{
-		const int row_stride = xres * output_bytes;
 		// write jpg
 		if (output_bytes == 3) // swap bgr<->rgb
 		{
@@ -658,15 +616,14 @@ int main(int argc, char **argv)
 			#pragma omp parallel for shared(output)
 			for (y=0; y<yres; y++)
 			{
-				unsigned char *scanline = output + (y * row_stride);
+				int xres1=y*xres*3;
+				int xres2=xres1+2;
 				int x;
 				for (x=0; x<xres; x++)
 				{
-					const int xs = x * 4;
-					const int xd = x * 3;
-					scanline[xd + 0] = scanline[xs + 2];
-					scanline[xd + 1] = scanline[xs + 1];
-					scanline[xd + 2] = scanline[xs + 0];
+					int x2=x*3;
+					memcpy(output+x2+xres1,output+x*4+y*xres*4,3);
+					SWAP(output[x2+xres1],output[x2+xres2]);
 				}
 			}
 		}
@@ -674,6 +631,7 @@ int main(int argc, char **argv)
 		struct jpeg_compress_struct cinfo;
 		struct jpeg_error_mgr jerr;
 		JSAMPROW row_pointer[1];
+		int row_stride;
 		cinfo.err = jpeg_std_error(&jerr);
 
 		jpeg_create_compress(&cinfo);
@@ -686,6 +644,7 @@ int main(int argc, char **argv)
 		jpeg_set_defaults(&cinfo);
 		jpeg_set_quality(&cinfo,jpg_quality, TRUE);
 		jpeg_start_compress(&cinfo, TRUE);
+		row_stride = xres * 3;
 		while (cinfo.next_scanline < cinfo.image_height)
 		{
 			row_pointer[0] = & output[cinfo.next_scanline * row_stride];
@@ -695,12 +654,10 @@ int main(int argc, char **argv)
 		jpeg_destroy_compress(&cinfo);
 	}
 
-	if (filename)
-		fclose(fd2);
+	fclose(fd2);
 
 	// Thats all folks
-	if (!quiet)
-		fprintf(stderr, "... Done !\n");
+	printf("... Done !\n");
 
 	// clean up
 	free(video);
@@ -714,12 +671,12 @@ int main(int argc, char **argv)
 
 void getvideo(unsigned char *video, int *xres, int *yres)
 {
+	printf("Grabbing Video ...\n");
 	int mem_fd;
 	//unsigned char *memory;
 	void *memory;
-	if ((mem_fd = open("/dev/mem", O_RDWR|O_SYNC) ) < 0)
-	{
-		fprintf(stderr, "Mainmemory: can't open /dev/mem \n");
+	if ((mem_fd = open("/dev/mem", O_RDWR|O_SYNC) ) < 0) {
+		printf("Mainmemory: can't open /dev/mem \n");
 		return;
 	}
 
@@ -730,37 +687,278 @@ void getvideo(unsigned char *video, int *xres, int *yres)
 	int t,stride,res;
 	res = stride = 0;
 	char buf[256];
-	FILE *fp;
+	FILE *pipe;
 
-	if (stb_type > XILLEON)
+	if (stb_type == ST)
 	{
-		// grab bcm pic from decoder memory
-		const unsigned char* data = (unsigned char*)mmap(0, 100, PROT_READ, MAP_SHARED, mem_fd, registeroffset);
-		if(!data)
+		int yblock, xblock, iyblock, ixblock, yblockoffset, offset, layer_offset, OUTITER, OUTINC, OUTITERoffset;
+		int stride_half;
+		unsigned char *out;
+		unsigned char even, cr;
+		int fd_bpa;
+		int ioctlres;
+		BPAMemMapMemData bpa_data;
+		char bpa_mem_device[30];
+		char *decode_surface;
+		int delay;
+
+		pipe = fopen("/proc/stb/vmpeg/0/xres","r");
+		if (pipe)
 		{
-			fprintf(stderr, "Mainmemory: <Memmapping failed>\n");
+			while (fgets(buf,sizeof(buf),pipe))
+			{
+				sscanf(buf,"%x",&stride);
+			}
+			fclose(pipe);
+		}
+		pipe = fopen("/proc/stb/vmpeg/0/yres","r");
+		if (pipe)
+		{
+			while (fgets(buf,sizeof(buf),pipe))
+			{
+				sscanf(buf,"%x",&res);
+			}
+			fclose(pipe);
+		}
+
+		//if stride and res is zero than this is most probably a stillpicture
+		if(stride == 0) stride = 1280;
+		if(res == 0) res = 720;
+
+		stride_half = stride / 2;
+
+		luma   = (unsigned char *)malloc(stride * res);
+		chroma = (unsigned char *)malloc(stride * res / 2);
+
+		memset(chroma, 0x80, stride * res / 2);
+
+		fd_bpa = open("/dev/bpamem0", O_RDWR);
+
+		if(fd_bpa < 0)
+		{
+			fprintf(stderr, "cannot access /dev/bpamem0! err = %d\n", fd_bpa);
 			return;
 		}
 
-		int adr, adr2, ofs, ofs2, offset, pageoffset;
+		bpa_data.bpa_part  = "LMI_VID";
+		bpa_data.phys_addr = 0x00000000;
+		bpa_data.mem_size = 0;
+
+		pipe = fopen("/proc/bpa2","r");
+		if (pipe)
+		{
+			unsigned char found_part = 0;
+			unsigned long mem_size = 0;
+			unsigned long phys_addr = 0;
+			while (fgets(buf,sizeof(buf),pipe))
+			{
+				if(found_part || strstr(buf, bpa_data.bpa_part) != NULL)
+				{
+					found_part = 1;
+					if (sscanf(buf, "- %lu B at %lx", &mem_size, &phys_addr) == 2)
+					{
+						if(mem_size > bpa_data.mem_size)
+						{
+							bpa_data.mem_size  = mem_size;
+							bpa_data.phys_addr = phys_addr;
+						}
+					}
+				}
+			}
+			fclose(pipe);
+		}
+
+		printf("Using bpa2 part %s - 0x%lx %lu\n", bpa_data.bpa_part, bpa_data.phys_addr, bpa_data.mem_size);
+
+		//bpa_data.phys_addr = 0x4a824000;
+		//bpa_data.mem_size = 28311552;
+
+		ioctlres = ioctl(fd_bpa, BPAMEMIO_MAPMEM, &bpa_data); // request memory from bpamem
+		if(ioctlres)
+		{
+			fprintf(stderr, "cannot map required mem\n");
+			return;
+		}
+
+		sprintf(bpa_mem_device, "/dev/bpamem%d", bpa_data.device_num);
+		close(fd_bpa);
+
+		fd_bpa = open(bpa_mem_device, O_RDWR);
+
+		// if somebody forgot to add all bpamem devs then this gets really bad here
+		if(fd_bpa < 0)
+		{
+			fprintf(stderr, "cannot access %s! err = %d\n", bpa_mem_device, fd_bpa);
+			return;
+		}
+
+		decode_surface = (char *)mmap(0, bpa_data.mem_size, PROT_WRITE|PROT_READ, MAP_SHARED, fd_bpa, 0);
+
+		if(decode_surface == MAP_FAILED)
+		{
+			fprintf(stderr, "could not map bpa mem");
+			close(fd_bpa);
+			return;
+		}
+
+		//luma
+		layer_offset = 0;
+
+		//we do not have to round that every luma res will be a multiple of 16
+		yblock = res/16; //45
+		xblock = stride/16; //80
+
+		//thereby yblockoffset does also not to be rounded up
+		yblockoffset = xblock * 256/*16x16px*/ * 2/*2 block rows*/; //0xA000 for 1280
+
+		//printf("yblock: %u xblock:%u yblockoffset:0x%x\n", yblock, xblock, yblockoffset);
+
+		OUTITER       = 0;
+		OUTITERoffset = 0;
+		OUTINC        = 1; /*no spaces between pixel*/
+		out           = luma;
+
+		//wait_for_frame_sync
+		{
+			unsigned char old_frame[0x800]; /*first 2 luma blocks, 0:0 - 32:64*/
+			memcpy(old_frame, decode_surface, 0x800);
+			for(delay = 0; delay < 500/*ms*/; delay++)
+			{
+				if (memcmp(decode_surface, old_frame, 0x800) != 0)
+					break;
+				usleep(100);
+			}
+		}
+		//printf("framesync after %dms\n", delay);
+
+		//now we have 16,6ms(60hz) to 50ms(20hz) to get the whole picture
+		for(even = 0; even < 2; even++)
+		{
+			offset        = layer_offset + (even  << 8 /* * 0x100*/);
+			OUTITERoffset = even * xblock << 8 /* * 256=16x16px*/;
+
+			for (iyblock = even; iyblock < yblock; iyblock+=2)
+			{
+				for (ixblock = 0; ixblock < xblock; ixblock++)
+				{
+					int line;
+
+					OUTITER = OUTITERoffset;
+					for (line = 0; line < 16; line++)
+					{
+						OUT_LU_16(offset, line);
+						OUTITER += (stride - 16 /*we have already incremented by 16*/);
+					}
+
+					//0x00, 0x200, ...
+					offset += 0x200;
+					OUTITERoffset += 16;
+				}
+				OUTITERoffset += (stride << 5) - stride /* * 31*/;
+			}
+		}
+
+		//chroma
+		layer_offset = ((stride*res + (yblockoffset >> 1 /* /2*/ /*round up*/)) / yblockoffset) * yblockoffset;
+
+		//cb
+		//we do not have to round that every chroma y res will be a multiple of 16
+		//and every chroma x res /2 will be a multiple of 8
+		yblock = res >> 4 /* /16*/; //45
+		xblock = stride_half >> 3 /* /8*/; //no roundin
+
+		//if xblock is not even than we will have to move to the next even value an
+		yblockoffset = (((xblock + 1) >> 1 /* / 2*/) << 1 /* * 2*/ ) << 8 /* * 64=8x8px * 2=2 block rows * 2=cr cb*/;
+
+		//printf("yblock: %u xblock:%u yblockoffset:0x%x\n", yblock, xblock, yblockoffset);
+
+		OUTITER       = 0;
+		OUTITERoffset = 0;
+		OUTINC        = 2;
+		out           = chroma;
+
+		for(cr = 0; cr < 2; cr++)
+		{
+			for(even = 0; even < 2; even++)
+			{
+				offset        = layer_offset + (even  << 8 /* * 0x100*/);
+				OUTITERoffset = even * (xblock << 7 /* * 128=8x8px * 2*/) + cr;
+
+				for (iyblock = even; iyblock < yblock; iyblock+=2)
+				{
+					for (ixblock = 0; ixblock < xblock; ixblock++)
+					{
+						int line;
+						OUTITER = OUTITERoffset;
+
+						for (line = 0; line < 8; line++)
+						{
+							OUT_CH_8(offset, line, !cr);
+							OUTITER += (stride - 16 /*we have already incremented by OUTINC*8=16*/);
+						}
+
+						//0x00 0x80 0x200 0x280, ...
+						offset += (offset%0x100?0x180/*80->200*/:0x80/*0->80*/);
+						OUTITERoffset += 16/*OUTINC*8=16*/;
+					}
+					OUTITERoffset += (stride << 4) - stride /* * 15*/;
+				}
+			}
+		}
+
+		printf("framesync after %dms\n", delay);
+
+		munmap(decode_surface, bpa_data.mem_size);
+
+		ioctlres = ioctl(fd_bpa, BPAMEMIO_UNMAPMEM); // request memory from bpamem
+		if(ioctlres)
+		{
+			fprintf(stderr, "cannot unmap required mem\n");
+			close(fd_bpa);
+			return;
+		}
+
+		close(fd_bpa);
+	}
+	else if (stb_type == BRCM7401 || stb_type == BRCM7400 || stb_type == BRCM7405 || stb_type == BRCM7335 || stb_type == BRCM7358)
+	{
+		// grab brcm7401 pic from decoder memory
+		const unsigned char* data = (unsigned char*)mmap(0, 100, PROT_READ, MAP_SHARED, mem_fd, (stb_type == BRCM7358) ? 0x10600000 : 0x10100000);
+		if(!data)
+		{
+			printf("Mainmemory: <Memmapping failed>\n");
+			return;
+		}
+
+		int adr,adr2,ofs,ofs2,offset/*,vert_start,vert_end*/;
 		int xtmp,xsub,ytmp,t2,dat1;
 
-		ofs = data[chr_luma_register_offset + 8] << 4; /* luma lines */
-		ofs2 = data[chr_luma_register_offset + 12] << 4; /* chroma lines */
-		adr2 = data[chr_luma_register_offset + 3] << 24 | data[chr_luma_register_offset + 2] << 16 | data[chr_luma_register_offset + 1] << 8;
-		stride = data[0x15] << 8 | data[0x14];
-		adr = data[0x1f] << 24 | data[0x1e] << 16 | data[0x1d] << 8; /* start of videomem */
-		offset = adr2 - adr;
-		pageoffset = adr & 0xfff;
-		adr -= pageoffset;
-		adr2 -= pageoffset;
+		if (stb_type == BRCM7358)
+		{
+			stride=data[0x15]<< 8|data[0x14];
+			ofs=data[0x3c]<<4; // luma lines
+			ofs2=data[0x40]<<4;// chroma lines
+			adr=(data[0x1f]<<24|data[0x1e]<<16|data[0x1d]<<8|data[0x1c])&0xFFFFFF00; // start of  videomem
+			adr2=(data[0x37]<<24|data[0x36]<<16|data[0x35]<<8|data[0x34])&0xFFFFFF00;
+		}
+		else
+		{
+			//vert_start=data[0x1B]<<8|data[0x1A];
+			//vert_end=data[0x19]<<8|data[0x18];
+			stride=data[0x15]<<8|data[0x14];
+			ofs=(data[0x28]<<8|data[0x27])>>4; // luma lines
+			ofs2=(data[0x2c]<<8|data[0x2b])>>4;// chroma lines
+			adr=(data[0x1f]<<24|data[0x1e]<<16|data[0x1d]<<8|data[0x1c])&0xFFFFFF00; // start of  videomem
+			adr2=(data[0x23]<<24|data[0x22]<<16|data[0x21]<<8|data[0x20])&0xFFFFFF00;
+		}
+		offset=adr2-adr;
 
 		munmap((void*)data, 100);
 
-		fp=fopen("/proc/stb/vmpeg/0/yres","r");
-		while (fgets(buf,sizeof(buf),fp))
+		pipe=fopen("/proc/stb/vmpeg/0/yres","r");
+		while (fgets(buf,sizeof(buf),pipe))
 			sscanf(buf,"%x",&res);
-		fclose(fp);
+		fclose(pipe);
 
 		if (!adr || !adr2)
 		{
@@ -770,21 +968,21 @@ void getvideo(unsigned char *video, int *xres, int *yres)
 			return;
 		}
 
-		//fprintf(stderr, "Stride: %d Res: %d\n",stride,res);
-		//fprintf(stderr, "Adr: %X Adr2: %X OFS: %d %d\n",adr,adr2,ofs,ofs2);
+		//printf("Stride: %d Res: %d\n",stride,res);
+		//printf("Adr: %X Adr2: %X OFS: %d %d\n",adr,adr2,ofs,ofs2);
 
 		luma = (unsigned char *)malloc(stride*(ofs));
-		chroma = (unsigned char *)malloc(stride * ofs2);
+		chroma = (unsigned char *)malloc(stride*(ofs2+64));
 
 		int memory_tmp_size = 0;
 		// grabbing luma & chroma plane from the decoder memory
-		if (!mem2memdma_register)
+		if (stb_type == BRCM7401 || stb_type == BRCM7405 || stb_type == BRCM7358)
 		{
-			// we have direct access to the decoder memory
-			memory_tmp_size = offset + (stride + chr_luma_stride) * ofs2;
+			// on dm800/dm500hd we have direct access to the decoder memory
+			memory_tmp_size = offset + stride*(ofs2+64);
 			if(!(memory_tmp = (unsigned char*)mmap(0, memory_tmp_size, PROT_READ, MAP_SHARED, mem_fd, adr)))
 			{
-				fprintf(stderr, "Mainmemory: <Memmapping failed>\n");
+				printf("Mainmemory: <Memmapping failed>\n");
 				return;
 			}
 
@@ -793,24 +991,24 @@ void getvideo(unsigned char *video, int *xres, int *yres)
 							// result with a 50ms delay
 
 		}
-		else
+		else if (stb_type == BRCM7400 || stb_type == BRCM7335)
 		{
-			int tmp_size = offset + (stride + chr_luma_stride) * ofs2;
+			int tmp_size = offset + stride*(ofs2+64);
 			if (tmp_size > 2 * DMA_BLOCKSIZE)
 			{
-				fprintf(stderr, "Got invalid stride value from the decoder: %d\n", stride);
+				printf("Got invalid stride value from the decoder: %d\n", stride);
 				return;
 			}
 			memory_tmp_size = DMA_BLOCKSIZE + 0x1000;
 			if (!(memory_tmp = (unsigned char*)mmap(0, memory_tmp_size, PROT_READ|PROT_WRITE, MAP_SHARED, mem_fd, SPARE_RAM)))
 			{
-				fprintf(stderr, "Mainmemory: <Memmapping failed>\n");
+				printf("Mainmemory: <Memmapping failed>\n");
 				return;
 			}
 			volatile unsigned long *mem_dma;
-			if (!(mem_dma = (volatile unsigned long*)mmap(0, 0x1000, PROT_READ|PROT_WRITE, MAP_SHARED, mem_fd, mem2memdma_register)))
+			if(!(mem_dma = (volatile unsigned long*)mmap(0, 0x1000, PROT_READ|PROT_WRITE, MAP_SHARED, mem_fd, (stb_type == BRCM7400) ? 0x10c02000 : 0x10c01000)))
 			{
-				fprintf(stderr, "Mainmemory: <Memmapping failed>\n");
+				printf("Mainmemory: <Memmapping failed>\n");
 				return;
 			}
 
@@ -824,7 +1022,7 @@ void getvideo(unsigned char *video, int *xres, int *yres)
 				if (i + DMA_BLOCKSIZE > tmp_size)
 					tmp_len = tmp_size - i;
 
-				//fprintf(stderr, "DMACopy: %x (%d) size: %d\n", adr+i, i, tmp_len);
+				//printf("DMACopy: %x (%d) size: %d\n", adr+i, i, tmp_len);
 
 				descriptor[0] = /* READ */ adr + i;
 				descriptor[1] = /* WRITE */ SPARE_RAM + 0x1000;
@@ -852,6 +1050,10 @@ void getvideo(unsigned char *video, int *xres, int *yres)
 		}
 
 		t=t2=dat1=0;
+		int chr_luma_stride = 0x40;
+
+		if (stb_type == BRCM7405)
+			chr_luma_stride *= 2;
 
 		xsub=chr_luma_stride;
 		// decode luma & chroma plane or lets say sort it
@@ -863,7 +1065,7 @@ void getvideo(unsigned char *video, int *xres, int *yres)
 			dat1=xtmp;
 			for (ytmp = 0; ytmp < ofs; ytmp++)
 			{
-				memcpy(luma+dat1,memory_tmp+pageoffset+t,xsub); // luma
+				memcpy(luma+dat1,memory_tmp+t,xsub); // luma
 				t+=chr_luma_stride;
 				dat1+=stride;
 			}
@@ -878,7 +1080,7 @@ void getvideo(unsigned char *video, int *xres, int *yres)
 			dat1=xtmp;
 			for (ytmp = 0; ytmp < ofs2; ytmp++)
 			{
-				memcpy(chroma+dat1,memory_tmp+pageoffset+offset+t2,xsub); // chroma
+				memcpy(chroma+dat1,memory_tmp+offset+t2,xsub); // chroma
 				t2+=chr_luma_stride;
 				dat1+=stride;
 			}
@@ -894,8 +1096,8 @@ void getvideo(unsigned char *video, int *xres, int *yres)
 			SWAP(p[0], p[3]);
 			SWAP(p[1], p[2]);
 		}
-		count = (stride*ofs2) >> 2;
-		#pragma omp parallel for 
+		count = (stride*(ofs>>1)) >> 2;
+		#pragma omp parallel for
 		for (t = 0; t < count; ++t)
 		{
 			unsigned char* p = chroma + (4 * t);
@@ -903,144 +1105,32 @@ void getvideo(unsigned char *video, int *xres, int *yres)
 			SWAP(p[0], p[3]);
 			SWAP(p[1], p[2]);
 		}
-	}
-	else if (stb_type == AZBOX863x || stb_type == AZBOX865x) 
-	{
-	
-	  unsigned char *infos = 0 ,*lyuv = 0, *ptr;
-	  int fd, len = 0, x, y;
-	  unsigned int	chroma_w, chroma_h;
-	  unsigned int	luma_w, luma_h;
-	  unsigned int	luma_width, chroma_width;
-	  unsigned int	luma_size_tile, chroma_size_tile;
-	  unsigned char  *pluma;
-	  unsigned char  *pchroma;
-
-	   fd = open("/dev/frameyuv",O_RDWR);
-	   if(!fd) {
-		perror("/dev/frameyuv");		
-		return; 
-	   }
-
-	   infos = malloc(1920*1080*4);	 
-	   len = read(fd,infos,1920*1080*4); 
-
-	   if(len <= 0 ) {
-		 fprintf(stderr,"No picture info %d\n",len);
-		 free(infos);
-		 close(fd);
-		 return;
-	    }
-		
-	    luma_w = (infos[0]<<24) | (infos[1]<<16) | (infos[2]<<8) | (infos[3]);  
-	    luma_h = (infos[4]<<24) | (infos[5]<<16) | (infos[6]<<8) | (infos[7]);  
-	    luma_width = (infos[8]<<24) | (infos[9]<<16) | (infos[10]<<8) | (infos[11]);  
-	    chroma_w = (infos[12]<<24) | (infos[13]<<16) | (infos[14]<<8) | (infos[15]);  
-	    chroma_h = (infos[16]<<24) | (infos[17]<<16) | (infos[18]<<8) | (infos[19]);  
-	    chroma_width = (infos[20]<<24) | (infos[21]<<16) | (infos[22]<<8) | (infos[23]);  
-
-	    if (stb_type == AZBOX863x) {
-
-		luma_size_tile	= (((luma_w + 127)/128)*128) *  (((luma_h + 31)/32)*32);
-
-		chroma_size_tile	= (((chroma_w + 127)/128)*128) * (((chroma_h + 31)/32)*32); 
-	     } else {
-
-		luma_size_tile	= (((luma_w + 255)/256)*256) *  (((luma_h + 31)/32)*32);
-
-		chroma_size_tile	= (((chroma_w + 255)/256)*256) * (((chroma_h + 31)/32)*32); 
-	     }
-		
-	     pluma = infos + 24;
-	     pchroma = infos + 24 +luma_size_tile;
-		
-	     luma = (unsigned char *)malloc(luma_w * luma_h); 	 
-	     chroma = (unsigned char *)malloc(chroma_w * chroma_h * 2); 	  
-		
-	     stride = luma_w;
-	     res = luma_h;
-		 		 
-	     ptr = luma;
-	     if (stb_type == AZBOX863x) { 
-		 /* save the luma buffer Y */
-		for (y = 0 ; y < luma_h ; y++) {
-	    	  for (x = 0 ; x < luma_w ; x++) {
-			 unsigned char* pixel = (pluma +\
-			 (x/128) * 4096 + (y/32) * luma_width * 32 +
-			 (x % 128) + (y % 32)*128);
-
-			*ptr++ = *pixel;
-			}
-		  }
-
-		ptr = chroma;
-
-		/* break chroma buffer into U & V components */
-		for (y = 0 ; y < chroma_h ; y++) {
-			for (x = 0 ; x < chroma_w*2 ; x++) {
-				unsigned char* pixel = (pchroma +\
-			    (x/128) * 4096 + (y/32) * chroma_width * 32 +
-				 (x % 128) + (y % 32)*128);
-
-		 *ptr++ = *pixel;
-		 }
-	       }
-	     } else if (stb_type == AZBOX865x) {
-
-		 /* save the luma buffer Y */
-		for (y = 0 ; y < luma_h ; y++) {
-	    	  for (x = 0 ; x < luma_w ; x++) {
-			 unsigned char* pixel = (pluma +\
-			 (x/256) * 8192 + (y/32) * luma_width * 32 +
-			 (x % 256) + (y % 32)*256);
-
-			*ptr++ = *pixel;
-			}
-		  }
-
-		ptr = chroma;
-
-		/* break chroma buffer into U & V components */
-		for (y = 0 ; y < chroma_h ; y++) {
-			for (x = 0 ; x < chroma_w*2 ; x++) {
-				unsigned char* pixel = (pchroma +\
-			    (x/256) * 8192 + (y/32) * chroma_width * 32 +
-				 (x % 256) + (y % 32)*256);
-
-		 *ptr++ = *pixel;
-		 }	
-
-
-	      }		
-	     }
-	   	free(infos);		
-		close(fd);
-	}	
-	else if (stb_type == XILLEON)
+	} else if (stb_type == XILLEON)
 	{
 		// grab xilleon pic from decoder memory
-		fp = fopen("/proc/stb/vmpeg/0/xres","r");
-		if (fp)
+		pipe = fopen("/proc/stb/vmpeg/0/xres","r");
+		if (pipe)
 		{
-			while (fgets(buf,sizeof(buf),fp))
+			while (fgets(buf,sizeof(buf),pipe))
 			{
 				sscanf(buf,"%x",&stride);
 			}
-			fclose(fp);
+			fclose(pipe);
 		}
-		fp = fopen("/proc/stb/vmpeg/0/yres","r");
-		if (fp)
+		pipe = fopen("/proc/stb/vmpeg/0/yres","r");
+		if (pipe)
 		{
-			while (fgets(buf,sizeof(buf),fp))
+			while (fgets(buf,sizeof(buf),pipe))
 			{
 				sscanf(buf,"%x",&res);
 			}
-			fclose(fp);
+			fclose(pipe);
 		}
 
+		printf("ML - 1\n");
 		if(!(memory = (unsigned char*)mmap(0, 1920*1152*6, PROT_READ, MAP_SHARED, mem_fd, 0x6000000)))
 		{
-			fprintf(stderr, "Mainmemory: <Memmapping failed>\n");
+			printf("Mainmemory: <Memmapping failed>\n");
 			return;
 		}
 
@@ -1174,8 +1264,7 @@ void getvideo(unsigned char *video, int *xres, int *yres)
 
 		munmap(memory, 1920*1152*6);
 
-	}
-	else if (stb_type == VULCAN || stb_type == PALLAS)
+	} else if (stb_type == VULCAN || stb_type == PALLAS)
 	{
 		// grab via v4l device (ppc boxes)
 
@@ -1184,7 +1273,7 @@ void getvideo(unsigned char *video, int *xres, int *yres)
 		int fd_video = open(VIDEO_DEV, O_RDONLY);
 		if (fd_video < 0)
 		{
-			fprintf(stderr, "could not open /dev/video");
+			printf("could not open /dev/video");
 			return;
 		}
 
@@ -1213,6 +1302,7 @@ void getvideo(unsigned char *video, int *xres, int *yres)
 	close(mem_fd);
 
 	// yuv2rgb conversion (4:2:0)
+	printf("... converting Video from YUV to RGB color space\n");
 	const int rgbstride = stride * 3;
 	const int scans = res / 2;
 	int y;
@@ -1244,12 +1334,14 @@ void getvideo(unsigned char *video, int *xres, int *yres)
 			// now we do 4 pixels on each iteration this is more code but much faster
 			int Y=yuv2rgbtable_y[luma[pos]];
 
+			//p0:0
 			video[out1]=CLAMP((Y + RU)>>16);
 			video[out1+1]=CLAMP((Y - GV - GU)>>16);
 			video[out1+2]=CLAMP((Y + BV)>>16);
 
 			Y=yuv2rgbtable_y[luma[stride+pos]];
 
+			//p1:0
 			video[out1+rgbstride]=CLAMP((Y + RU)>>16);
 			video[out1+1+rgbstride]=CLAMP((Y - GV - GU)>>16);
 			video[out1+2+rgbstride]=CLAMP((Y + BV)>>16);
@@ -1259,12 +1351,14 @@ void getvideo(unsigned char *video, int *xres, int *yres)
 
 			Y=yuv2rgbtable_y[luma[pos]];
 
+			//p0:1
 			video[out1]=CLAMP((Y + RU)>>16);
 			video[out1+1]=CLAMP((Y - GV - GU)>>16);
 			video[out1+2]=CLAMP((Y + BV)>>16);
 
 			Y=yuv2rgbtable_y[luma[stride+pos]];
 
+			//p1:1
 			video[out1+rgbstride]=CLAMP((Y + RU)>>16);
 			video[out1+1+rgbstride]=CLAMP((Y - GV - GU)>>16);
 			video[out1+2+rgbstride]=CLAMP((Y + BV)>>16);
@@ -1276,6 +1370,7 @@ void getvideo(unsigned char *video, int *xres, int *yres)
 
 	*xres=stride;
 	*yres=res;
+	printf("... Video-Size: %d x %d\n",*xres,*yres);
 	free(luma);
 	free(chroma);
 }
@@ -1295,33 +1390,32 @@ void getosd(unsigned char *osd, int *xres, int *yres)
 		fb=open("/dev/fb0", O_RDWR);
 		if (fb == -1)
 		{
-			fprintf(stderr, "Framebuffer failed\n");
+			printf("Framebuffer failed\n");
 			return;
 		}
 	}
 
 	if(ioctl(fb, FBIOGET_FSCREENINFO, &fix_screeninfo) == -1)
 	{
-		fprintf(stderr, "Framebuffer: <FBIOGET_FSCREENINFO failed>\n");
+		printf("Framebuffer: <FBIOGET_FSCREENINFO failed>\n");
 		return;
 	}
 
 	if(ioctl(fb, FBIOGET_VSCREENINFO, &var_screeninfo) == -1)
 	{
-		fprintf(stderr, "Framebuffer: <FBIOGET_VSCREENINFO failed>\n");
+		printf("Framebuffer: <FBIOGET_VSCREENINFO failed>\n");
 		return;
 	}
 
 	if(!(lfb = (unsigned char*)mmap(0, fix_screeninfo.smem_len, PROT_READ | PROT_WRITE, MAP_SHARED, fb, 0)))
 	{
-		fprintf(stderr, "Framebuffer: <Memmapping failed>\n");
+		printf("Framebuffer: <Memmapping failed>\n");
 		return;
 	}
 
 	if ( var_screeninfo.bits_per_pixel == 32 )
 	{
-		if (!quiet)
-			fprintf(stderr, "Grabbing 32bit Framebuffer ...\n");
+		printf("Grabbing 32bit Framebuffer ...\n");
 
 		// get 32bit framebuffer
 		pos=pos1=pos2=0;
@@ -1336,14 +1430,14 @@ void getosd(unsigned char *osd, int *xres, int *yres)
 			unsigned char *memory; // use additional buffer to speed up especially when using hd skins
 			memory = (unsigned char *)malloc(fix_screeninfo.line_length*var_screeninfo.yres);
 			memcpy(memory,lfb,fix_screeninfo.line_length*var_screeninfo.yres);
+			printf("%d\n",ofs);
 			for (y=0; y < var_screeninfo.yres; y+=1)
 				memcpy(osd+y*var_screeninfo.xres*4,memory+y*fix_screeninfo.line_length,var_screeninfo.xres*4);
 			free(memory);
 		}
 	} else if ( var_screeninfo.bits_per_pixel == 16 )
 	{
-		if (!quiet)
-			fprintf(stderr, "Grabbing 16bit Framebuffer ...\n");
+		printf("Grabbing 16bit Framebuffer ...\n");
 		unsigned short color;
 
 		// get 16bit framebuffer
@@ -1363,11 +1457,9 @@ void getosd(unsigned char *osd, int *xres, int *yres)
 			}
 			pos2+=ofs;
 		}
-	}
-	else if ( var_screeninfo.bits_per_pixel == 8 )
+	} else if ( var_screeninfo.bits_per_pixel == 8 )
 	{
-		if (!quiet)
-			fprintf(stderr, "Grabbing 8bit Framebuffer ...\n");
+		printf("Grabbing 8bit Framebuffer ...\n");
 		unsigned short color;
 
 		// Read Color Palette directly from the main memory, because the FBIOGETCMAP is buggy on dream and didnt
@@ -1377,13 +1469,13 @@ void getosd(unsigned char *osd, int *xres, int *yres)
 		unsigned short rd[256], gn[256], bl[256], tr[256];
 
 		if ((mem_fd = open("/dev/mem", O_RDWR) ) < 0) {
-			fprintf(stderr, "Mainmemory: can't open /dev/mem \n");
+			printf("Mainmemory: can't open /dev/mem \n");
 			return;
 		}
 
 		if(!(memory = (unsigned char*)mmap(0, fix_screeninfo.smem_len, PROT_READ | PROT_WRITE, MAP_SHARED, mem_fd, fix_screeninfo.smem_start-0x1000)))
 		{
-			fprintf(stderr, "Mainmemory: <Memmapping failed>\n");
+			printf("Mainmemory: <Memmapping failed>\n");
 			return;
 		}
 
@@ -1409,8 +1501,7 @@ void getosd(unsigned char *osd, int *xres, int *yres)
 
 				pos2++;
 			}
-		}
-		else if (stb_type == PALLAS) // DM70x0 stores the colors in plain rgb values
+		} else if (stb_type == PALLAS) // DM70x0 stores the colors in plain rgb values
 		{
 			pos2 = 0;
 			for (pos1=32; pos1<(256*4)+32; pos1+=4)
@@ -1421,10 +1512,9 @@ void getosd(unsigned char *osd, int *xres, int *yres)
 				tr[pos2]=memory[pos1];
 				pos2++;
 			}
-		}
-		else
+		} else
 		{
-			fprintf(stderr, "unsupported framebuffermode\n");
+			printf("unsupported framebuffermode\n");
 			return;
 		}
 		close(mem_fd);
@@ -1450,8 +1540,7 @@ void getosd(unsigned char *osd, int *xres, int *yres)
 
 	*xres=var_screeninfo.xres;
 	*yres=var_screeninfo.yres;
-	if (!quiet)
-		fprintf(stderr, "... Framebuffer-Size: %d x %d\n",*xres,*yres);
+	printf("... Framebuffer-Size: %d x %d\n",*xres,*yres);
 }
 
 // bicubic pixmap resizing
