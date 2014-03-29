@@ -34,6 +34,7 @@ Feel free to use the code for your own projects. See LICENSE file for details.
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
+#include <sys/time.h>
 #include <sys/mman.h>
 #include <linux/types.h>
 #include <linux/fb.h>
@@ -89,6 +90,29 @@ Feel free to use the code for your own projects. See LICENSE file for details.
 #define CBFB(x)  ((((x) >> (6)) & 0xf) << 4)
 #define CRFB(x)   ((((x) >> (2)) & 0xf) << 4)
 #define BFFB(x)   ((((x) >> (0)) & 0x3) << 6)
+
+int timeval_subtract (struct timeval *result, struct timeval *x, struct timeval *y)
+{
+	/* Perform the carry for the later subtraction by updating y. */
+	if (x->tv_usec < y->tv_usec) {
+		int nsec = (y->tv_usec - x->tv_usec) / 1000000 + 1;
+		y->tv_usec -= 1000000 * nsec;
+		y->tv_sec += nsec;
+	}
+	if (x->tv_usec - y->tv_usec > 1000000) {
+		int nsec = (x->tv_usec - y->tv_usec) / 1000000;
+		y->tv_usec += 1000000 * nsec;
+		y->tv_sec -= nsec;
+	}
+
+	/* Compute the time remaining to wait.
+	  tv_usec is certainly positive. */
+	result->tv_sec = x->tv_sec - y->tv_sec;
+	result->tv_usec = x->tv_usec - y->tv_usec;
+
+	/* Return 1 if result is negative. */
+	return x->tv_sec < y->tv_sec;
+}
 
 #define VIDEO_DEV "/dev/video"
 
@@ -729,8 +753,15 @@ void getvideo(unsigned char *video, int *xres, int *yres)
 
 		luma   = (unsigned char *)malloc(stride * res);
 		chroma = (unsigned char *)malloc(stride * res / 2);
+		char *temp = (unsigned char *)malloc(4 * 1024 * 1024);
+		if( NULL == temp )  {
+			printf("can not allocate memory\n");
+			return;
+		}
 
 		memset(chroma, 0x80, stride * res / 2);
+		memset(luma, 0x00, stride * res); /* just to invalidate the page */
+		memset(temp, 0x00, 4 * 1024 * 1024); /* just to invalidate the page */
 
 		fd_bpa = open("/dev/bpamem0", O_RDWR);
 
@@ -792,15 +823,15 @@ void getvideo(unsigned char *video, int *xres, int *yres)
 			return;
 		}
 
-		decode_surface = (char *)mmap(0, bpa_data.mem_size, PROT_WRITE|PROT_READ, MAP_SHARED, fd_bpa, 0);
-
-		if(decode_surface == MAP_FAILED)
+		char *decode_map = (char *)mmap(0, bpa_data.mem_size, PROT_WRITE|PROT_READ, MAP_SHARED, fd_bpa, 0);
+		if(decode_map == MAP_FAILED)
 		{
 			fprintf(stderr, "could not map bpa mem");
 			close(fd_bpa);
 			return;
 		}
 
+		fprintf(stderr, "decode surface size:  %d\n", bpa_data.mem_size );
 		//luma
 		layer_offset = 0;
 
@@ -818,18 +849,29 @@ void getvideo(unsigned char *video, int *xres, int *yres)
 		OUTINC        = 1; /*no spaces between pixel*/
 		out           = luma;
 
+		struct timeval start_tv;
+		struct timeval stop_tv;
+		struct timeval result_tv;
+
+
 		//wait_for_frame_sync
 		{
 			unsigned char old_frame[0x800]; /*first 2 luma blocks, 0:0 - 32:64*/
-			memcpy(old_frame, decode_surface, 0x800);
+			memcpy(old_frame, decode_map, 0x800);
+			gettimeofday(&start_tv, NULL);
+			memcmp(decode_map, old_frame, 0x800);
+			gettimeofday(&stop_tv, NULL);
 			for(delay = 0; delay < 500/*ms*/; delay++)
 			{
-				if (memcmp(decode_surface, old_frame, 0x800) != 0)
+				if (memcmp(decode_map, old_frame, 0x800) != 0)
 					break;
 				usleep(100);
 			}
 		}
-		//printf("framesync after %dms\n", delay);
+		//gettimeofday(&start_tv, NULL);
+		memcpy(temp,decode_map,4*1024*1024);
+		//gettimeofday(&stop_tv, NULL);
+		decode_surface = temp;
 
 		//now we have 16,6ms(60hz) to 50ms(20hz) to get the whole picture
 		for(even = 0; even < 2; even++)
@@ -905,10 +947,11 @@ void getvideo(unsigned char *video, int *xres, int *yres)
 				}
 			}
 		}
+		timeval_subtract(&result_tv,&stop_tv,&start_tv);
+		printf("framesync after:     %dms\n", delay);
+		printf("frame copy duration: %fms\n", (((float)result_tv.tv_sec)*1000.0f+((float)result_tv.tv_usec)/1000.0f));
 
-		printf("framesync after %dms\n", delay);
-
-		munmap(decode_surface, bpa_data.mem_size);
+		munmap(decode_map, bpa_data.mem_size);
 
 		ioctlres = ioctl(fd_bpa, BPAMEMIO_UNMAPMEM); // request memory from bpamem
 		if(ioctlres)
